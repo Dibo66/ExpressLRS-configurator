@@ -1,10 +1,129 @@
-const { app, globalShortcut, BrowserWindow, Menu, ipcMain, shell } = require('electron')
+const { app, globalShortcut, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron')
 const path = require('path')
 const fs = require("fs");
 const readline = require('readline');
 const menu = require('./menu')
 const { spawn } = require('child_process')
 const log = require('electron-log');
+const os = require('os');
+
+// list of used platforms
+const platforms = {
+    WINDOWS: 'WINDOWS',
+    MAC: 'MAC',
+    LINUX: 'LINUX',
+};
+
+// mapping platform to platform names
+const platformsNames = {
+    win32: platforms.WINDOWS,
+    darwin: platforms.MAC,
+    linux: platforms.LINUX,
+};
+
+// get current platform
+const currentPlatform = platformsNames[os.platform()];
+
+const findHandlerOrDefault = (handlerName, dictionary) => {
+    const handler = dictionary[handlerName];
+
+    if (handler) {
+        return handler;
+    }
+
+    if (dictionary.default) {
+        return dictionary.default;
+    }
+
+    return () => null;
+};
+
+const byOS = findHandlerOrDefault.bind(null, currentPlatform);
+
+
+
+
+
+
+// helper function to run script in terminal
+function runScript(command, args, callback) {
+    log.info('Executing script: ' + command + ' ' + args);
+
+    // spawn os subprocess
+    var child = spawn(command, args, {
+        encoding: 'utf8',
+        shell: true
+    });
+
+    // fetch error
+    child.on('error', (error) => {
+        // log error data
+        error = error.toString();
+        log.error(error);
+
+        // TODO: show more cool-looking notifications
+        // dialog.showMessageBox({
+        //     title: 'Error',
+        //     type: 'error',
+        //     message: 'Unable to execute script \'' + command + '\'. Error: \r\n' + error
+        // }).then((data) => {
+        //     log.debug("Clicked dialog button #" + data.response);
+        //     if (0 === data.response) {
+        //         app.quit();
+        //     }
+        // });
+    });
+
+    // fetch stdout
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (data) => {
+        // log stdout data
+        data = data.toString();
+        log.info(data);
+    });
+
+    // fetch stderr
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (data) => {
+        // log stderr data
+        data = data.toString();
+        log.error(data);
+
+        // TODO: show more cool-looking notifications
+        dialog.showMessageBox({
+            title: 'Error',
+            type: 'error',
+            message: 'Unable to execute script:\r\n \'' + command + ' ' + args + '\'. \r\nError: \r\n' + data
+        }).then((data) => {
+            log.debug("Clicked dialog button #" + data.response);
+            if (0 === data.response) {
+                app.quit();
+            }
+        });
+    });
+
+    // fetch dialog close event
+    child.on('close', (code) => {
+        switch (code) {
+            case 0:
+                {
+                    log.info('Successfully executed script: ' + command + ' ' + args);
+
+                    // run success callback function
+                    if (typeof callback === 'function') {
+                        callback();
+                    }
+
+                    break;
+                }
+        }
+    });
+
+    return child;
+}
+
+// get configurator version
+const appVersion = '' + app.getVersion();
 
 // set production dir before generating local os archive of application or use empty string for development
 const srcDir = "./"; // use './resources/app/' for production
@@ -15,10 +134,9 @@ log.transports.file.resolvePath = (variables) => {
     return path.join(variables.fileName);
 }
 
-const localElrsPythonVenvDir = "./elrs-cli/venv/"
 const localElrsDir = srcDir + "ExpressLRS/"
 
-// Handle creating/removing shortcuts on Windows when installing/uninstalling.
+// handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) { // eslint-disable-line global-require
     app.quit();
 }
@@ -30,36 +148,38 @@ const createSetupWindow = () => {
     setupUpdateWindow = new BrowserWindow({
         width: 874,
         height: 300,
+        webPreferences: {
+            nodeIntegration: true
+        },
         frame: false,
         show: false
     });
 
-    // and load the index.html of the app.
+    // and load the setup.html of the app.
     setupUpdateWindow.loadFile(path.join(__dirname, 'setup.html'));
 
     setupUpdateWindow.once('ready-to-show', () => {
         setupUpdateWindow.show();
+        setupUpdateWindow.webContents.send('version', appVersion);
 
-        if (needElrsSetup()) {
-            // setup ExpressLRS Python 3 venv locally
-            setupElrsLocally();
-        } else {
-            activateElrsPythonVenv();
-        }
+        // start setup procedures
+        setupElrsLocally();
     })
 };
 
 let aboutWindow
-const createMainWindow = () => {
+const createAboutWindow = () => {
 
     aboutWindow = new BrowserWindow({
         width: 390,
         height: 420,
+        webPreferences: {
+            nodeIntegration: true
+        },
         frame: false,
         show: false
     });
 
-    // and load the index.html of the app.
     aboutWindow.loadFile(path.join(__dirname, 'about.html'));
 
     // when focus is lost on about window - hide it
@@ -72,6 +192,13 @@ const createMainWindow = () => {
         e.preventDefault();
         shell.openExternal(url);
     });
+
+    aboutWindow.once('ready-to-show', () => {
+        aboutWindow.webContents.send('version', appVersion);
+    })
+};
+
+const createMainWindow = () => {
 
     // create the browser window.
     mainWindow = new BrowserWindow({
@@ -97,6 +224,10 @@ const createMainWindow = () => {
     // apply default menu
     const mainMenu = Menu.buildFromTemplate(menu);
     Menu.setApplicationMenu(mainMenu);
+
+    mainWindow.once('ready-to-show', () => {
+        mainWindow.webContents.send('version', appVersion);
+    })
 };
 
 // This method will be called when Electron has finished
@@ -108,6 +239,8 @@ app.on('ready', () => {
     })
 
     createSetupWindow();
+
+    createAboutWindow();
 
     createMainWindow();
 });
@@ -173,14 +306,6 @@ ipcMain.handle('update-elrs-branches-clicked', () => {
     listElrsBranches();
 });
 
-function needElrsSetup() {
-    if (!fs.existsSync(localElrsPythonVenvDir)) {
-        return true;
-    } else {
-        return false;
-    }
-}
-
 function needElrsGithubRepoClone() {
     if (!fs.existsSync(localElrsDir)) {
         return true;
@@ -189,102 +314,231 @@ function needElrsGithubRepoClone() {
     }
 }
 
+function localFileExists(path) {
+    if (fs.existsSync(path)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+
+
+
+const winDirPythonEmbedded = "./setup/win/python-3.8.8-embed-amd64/python.exe";
+
+function cloneExpressLRS() {
+
+    // TODO: check if we already have git installed
+    log.info("Checking for already cloned ExpressLRS project");
+
+    if (!localFileExists(localElrsDir)) {
+
+        log.info("Local ExpressLRS repository not found! Starting cloning...");
+
+        // install Portable Git
+        runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -c\"\""], pullExpressLRS);
+    } else {
+        log.info("Found local ExpressLRS repository");
+        pullExpressLRS();
+    }
+}
+
+function pullExpressLRS() {
+
+    // TODO: check if we already have git installed
+    log.info("Updating local ExpressLRS project");
+
+    runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -p\"\""], autoPullElrsGithubRepo);
+}
+
+
+
+
+
+let installGitProcess = null
+
+function extractWinGit() {
+
+    // TODO: check if we already have git installed. Currently using Portable git version.
+
+    log.info("Checking for local Portable Git installation");
+
+    const winDirPortableGit = ".\\setup\\win\\PortableGit-2.30.1-64-bit\\git-bash.exe";
+    if (!localFileExists(winDirPortableGit)) {
+
+        log.info("Local Portable Git not found! Starting installation...");
+
+        // install Portable Git
+        installGitProcess = runScript("cmd", ["/C \"\"C:/Program Files/7-zip/7z.exe\" x \"./setup/win/PortableGit-2.30.1-64-bit.7z.exe\" -o./setup/win/PortableGit-2.30.1-64-bit -aos\"\""], cloneExpressLRS);
+    } else {
+        log.info("Found local Portable Git installation");
+        cloneExpressLRS();
+    }
+}
+
+function installLinuxGit() {}
+
+function installMacGit() {}
+
+// cross-platform Git install procedures
+function installGit() {
+    byOS({
+        [platforms.WINDOWS]: extractWinGit(),
+        [platforms.LINUX]: installLinuxGit(),
+        [platforms.MAC]: installMacGit(),
+    });
+}
+
+let installPythonToolsProcess = null;
+
+function installWinPythonTools() {
+    log.info("Installing Python tools needed for ExpressLRS");
+
+    // install Python tools for ExpressLRS
+    installPythonToolsProcess = runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/setup.py\" -s\"\""], installGit);
+}
+
+function installLinuxPythonTools() {}
+
+function installMacPythonTools() {}
+
+// cross-platform ExpressLRS Python tools install procedures - should be called once after Python installation
+function installPythonTools() {
+    byOS({
+        [platforms.WINDOWS]: installWinPythonTools(),
+        [platforms.LINUX]: installLinuxPythonTools(),
+        [platforms.MAC]: installMacPythonTools(),
+    });
+}
+
+let installPythonProcess = null;
+
+function extractWinPython() {
+    log.info("Checking for local Python embedded installation");
+
+    if (!localFileExists(winDirPythonEmbedded)) {
+
+        log.info("Local Python embedded not found! Starting installation...");
+
+        // install Python embedded
+        installPythonProcess = runScript("cmd", ["/C \"\"C:/Program Files/7-zip/7z.exe\" x \"./setup/win/python-3.8.8-embed-amd64.7z\" -o./setup/win -aos\"\""], installPythonTools);
+    } else {
+        log.info("Found local Python embedded installation");
+        installGit();
+    }
+}
+
+function installLinuxPython() {}
+
+function installMacPython() {}
+
+// cross-platform Python install procedures
+function installPython() {
+    byOS({
+        [platforms.WINDOWS]: extractWinPython(),
+        [platforms.LINUX]: installLinuxPython(),
+        [platforms.MAC]: installMacPython(),
+    });
+}
+
 let setupElrsProcess = null
-const setupElrsLocally = () => {
 
-    setupElrsProcess = spawn('py', ['-3', srcDir + 'elrs-cli/setup.py', '-s']);
+function setupWinElrsLocally() {
 
-    if (setupElrsProcess != null) {
-        log.info('Setting up ExpressLRS locally');
+    log.info("Checking for local 7-Zip installation");
 
-        setupElrsProcess.stdout.on('data', function(data) {
-            log.info(data.toString());
-        });
+    const winDir7zip = "C:/Program Files/7-Zip/7z.exe";
+    if (!localFileExists(winDir7zip)) {
 
-        setupElrsProcess.on('exit', (code) => {
-            if (Number(0) === Number(code)) {
-                log.info('Successfully finished setup ExpressLRS locally. Exit code: %s', code);
+        log.info("Local 7-Zip installation not found! Starting installation...")
 
-                // check and update local ExpressLRS repository if needed
-                if (needElrsGithubRepoClone()) {
-                    // clone ExpressLRS at startup if starting for first time - THIS TAKES A WHILE... BE PATIENT!
-                    autoCloneElrsGithubRepo();
-                } else {
-                    // just update local ExpressLRS repository with latest changes from master
-                    autoPullElrsGithubRepo();
-                }
-            } else {
-                log.error('Failed setup ExpressLRS locally. Exit code: %s', code);
-
-                // quit application if error while setting up
-                app.quit();
-            }
-        });
+        // install 7-Zip archiver
+        setupElrsProcess = runScript("cmd", ["/C \"\"./setup/win/7zip-install.cmd\"\""], installPython);
+    } else {
+        log.info("Found local 7-Zip installation");
+        installPython();
     }
 }
 
-let activatePythonVenvProcess = null
-const activateElrsPythonVenv = () => {
+function setupLinuxElrsLocally() {}
 
-    activatePythonVenvProcess = spawn('py', ['-3', srcDir + 'elrs-cli/setup.py', '-a']);
+function setupMacElrsLocally() {}
 
-    if (activatePythonVenvProcess != null) {
-        log.info('Activating ExpressLRS Python venv locally');
-
-        activatePythonVenvProcess.stdout.on('data', function(data) {
-            log.info(data.toString());
-        });
-
-        activatePythonVenvProcess.on('exit', (code) => {
-            if (Number(0) === Number(code)) {
-                log.info('Successfully activated ExpressLRS Python venv locally. Exit code: %s', code);
-
-                // check and update local ExpressLRS repository if needed
-                if (needElrsGithubRepoClone()) {
-                    // clone ExpressLRS at startup if starting for first time - THIS TAKES A WHILE... BE PATIENT!
-                    autoCloneElrsGithubRepo();
-                } else {
-                    // just update local ExpressLRS repository with latest changes from master
-                    autoPullElrsGithubRepo();
-                }
-            } else {
-                log.error('Failed activating ExpressLRS Python venv locally. Exit code: %s', code);
-
-                // quit application if error while activating venv
-                app.quit();
-            }
-        });
-    }
+// cross-platform setup procedures
+function setupElrsLocally() {
+    byOS({
+        [platforms.WINDOWS]: setupWinElrsLocally(),
+        [platforms.LINUX]: setupLinuxElrsLocally(),
+        [platforms.MAC]: setupMacElrsLocally(),
+    });
 }
 
-let autoCloneElrsProcess = null
-const autoCloneElrsGithubRepo = () => {
 
-    // execute child process
-    autoCloneElrsProcess = spawn('py', ['-3', srcDir + 'elrs-cli/elrs-cli.py', '-c']);
 
-    if (autoCloneElrsProcess != null) {
-        log.info('Cloning ExpressLRS locally');
 
-        autoCloneElrsProcess.stdout.on('data', function(data) {
-            log.info(data.toString());
-        });
+// let activatePythonVenvProcess = null
+// const activateElrsPythonVenv = () => {
 
-        autoCloneElrsProcess.on('exit', (code) => {
-            if (Number(0) === Number(code)) {
-                log.info('Cloning ExpressLRS locally finished successfully. Exit code: %s', code);
+//     activatePythonVenvProcess = spawn('py', ['-3', srcDir + 'elrs-cli/setup.py', '-a']);
 
-                // update local ExpressLRS repository with latest changes from master after cloning master code locally
-                autoPullElrsGithubRepo();
-            } else {
-                log.error('Failed cloning ExpressLRS locally. Exit code: %s', code);
+//     if (activatePythonVenvProcess != null) {
+//         log.info('Activating ExpressLRS Python venv locally');
 
-                // TODO: show popup window marking an error while cloning ExpressLRS locally instead quiting directly
-                app.quit();
-            }
-        });
-    }
-}
+//         activatePythonVenvProcess.stdout.on('data', function(data) {
+//             log.info(data.toString());
+//         });
+
+//         activatePythonVenvProcess.on('exit', (code) => {
+//             if (Number(0) === Number(code)) {
+//                 log.info('Successfully activated ExpressLRS Python venv locally. Exit code: %s', code);
+
+//                 // check and update local ExpressLRS repository if needed
+//                 if (needElrsGithubRepoClone()) {
+//                     // clone ExpressLRS at startup if starting for first time - THIS TAKES A WHILE... BE PATIENT!
+//                     autoCloneElrsGithubRepo();
+//                 } else {
+//                     // just update local ExpressLRS repository with latest changes from master
+//                     autoPullElrsGithubRepo();
+//                 }
+//             } else {
+//                 log.error('Failed activating ExpressLRS Python venv locally. Exit code: %s', code);
+
+//                 // quit application if error while activating venv
+//                 app.quit();
+//             }
+//         });
+//     }
+// }
+
+// let autoCloneElrsProcess = null
+// const autoCloneElrsGithubRepo = () => {
+
+//     // execute child process
+//     autoCloneElrsProcess = spawn('py', ['-3', srcDir + 'elrs-cli/elrs-cli.py', '-c']);
+
+//     if (autoCloneElrsProcess != null) {
+//         log.info('Cloning ExpressLRS locally');
+
+//         autoCloneElrsProcess.stdout.on('data', function(data) {
+//             log.info(data.toString());
+//         });
+
+//         autoCloneElrsProcess.on('exit', (code) => {
+//             if (Number(0) === Number(code)) {
+//                 log.info('Cloning ExpressLRS locally finished successfully. Exit code: %s', code);
+
+//                 // update local ExpressLRS repository with latest changes from master after cloning master code locally
+//                 autoPullElrsGithubRepo();
+//             } else {
+//                 log.error('Failed cloning ExpressLRS locally. Exit code: %s', code);
+
+//                 // TODO: show popup window marking an error while cloning ExpressLRS locally instead quiting directly
+//                 app.quit();
+//             }
+//         });
+//     }
+// }
 
 // Manual cloning from menu
 let cloneElrsProcess = null
@@ -321,38 +575,39 @@ const cloneElrsGithubRepo = () => {
 let autoPullElrsProcess = null
 const autoPullElrsGithubRepo = () => {
 
-    autoPullElrsProcess = spawn('py', ['-3', srcDir + 'elrs-cli/elrs-cli.py', '-p']);
+    // autoPullElrsProcess = spawn('py', ['-3', srcDir + 'elrs-cli/elrs-cli.py', '-p']);
 
-    if (autoPullElrsProcess != null) {
-        log.info('Updating ExpressLRS locally.');
+    // if (autoPullElrsProcess != null) {
+    //     log.info('Updating ExpressLRS locally.');
 
-        autoPullElrsProcess.stdout.on('data', function(data) {
-            log.info(data.toString());
-        });
+    //     autoPullElrsProcess.stdout.on('data', function(data) {
+    //         log.info(data.toString());
+    //     });
 
-        autoPullElrsProcess.on('exit', (code) => {
-            if (Number(0) === Number(code)) {
-                log.info('Successfully updated ExpressLRS locally. Exit code: %s', code);
+    //     autoPullElrsProcess.on('exit', (code) => {
+    //         if (Number(0) === Number(code)) {
+    let code = 3;
+    log.info('Successfully updated ExpressLRS locally. Exit code: %s', code);
 
-                // show main window
-                mainWindow.show();
+    // show main window
+    mainWindow.show();
 
-                // hide setup and update window
-                setupUpdateWindow.hide();
+    // hide setup and update window
+    setupUpdateWindow.hide();
 
-                // fetch latest ExpressLRS branches
-                listElrsBranches();
+    // fetch latest ExpressLRS branches
+    listElrsBranches();
 
-                // send event for success pull
-                mainWindow.webContents.send('elrs-pull-success')
-            } else {
-                log.error('Failed updating ExpressLRS locally. Exit code: %s', code);
+    // send event for success pull
+    mainWindow.webContents.send('elrs-pull-success')
+        //         } else {
+        //             log.error('Failed updating ExpressLRS locally. Exit code: %s', code);
 
-                // TODO: show popup window marking an error while pulling latest ExpressLRS repository changes locally instead quiting directly
-                app.quit();
-            }
-        });
-    }
+    //             // TODO: show popup window marking an error while pulling latest ExpressLRS repository changes locally instead quiting directly
+    //             app.quit();
+    //         }
+    //     });
+    // }
 }
 
 let pullElrsProcess = null
@@ -550,26 +805,39 @@ const uploadElrsFirmwareForTarget = (target) => {
 
 const killAllProcesses = () => {
     log.info('Killing all ExpressLRS CLI processes');
-    setupElrsProcess.kill();
-    setupElrsProcess = null;
 
-    activatePythonVenvProcess.kill();
-    activatePythonVenvProcess = null;
+    if (null != setupElrsProcess) {
+        setupElrsProcess.kill();
+        setupElrsProcess = null;
+        log.debug("\'setupElrsProcess\' successfully killed!")
+    }
 
-    cloneElrsProcess.kill();
-    cloneElrsProcess = null;
+    if (null != installPythonProcess) {
+        installPythonProcess.kill();
+        installPythonProcess = null;
+        log.debug("\'installPythonProcess\' successfully killed!")
+    }
 
-    pullElrsProcess.kill();
-    pullElrsProcess = null;
+    if (null != installGitProcess) {
+        installGitProcess.kill();
+        installGitProcess = null;
+        log.debug("\'installGitProcess\' successfully killed!")
+    }
 
-    listElrsBranchesProcess.kill();
-    listElrsBranchesProcess = null;
+    // cloneElrsProcess.kill();
+    // cloneElrsProcess = null;
 
-    buildElrsFirmwareProcess.kill();
-    buildElrsFirmwareProcess = null;
+    // pullElrsProcess.kill();
+    // pullElrsProcess = null;
 
-    uploadElrsFirmwareProcess.kill();
-    uploadElrsFirmwareProcess = null;
+    // listElrsBranchesProcess.kill();
+    // listElrsBranchesProcess = null;
+
+    // buildElrsFirmwareProcess.kill();
+    // buildElrsFirmwareProcess = null;
+
+    // uploadElrsFirmwareProcess.kill();
+    // uploadElrsFirmwareProcess = null;
 }
 
 // Kill all processes before quit application
