@@ -56,7 +56,9 @@ log.transports.file.resolvePath = (variables) => {
     return path.join(variables.fileName);
 }
 
-const localElrsDir = srcDir + "ExpressLRS/"
+const localElrsDir = srcDir + "ExpressLRS/";
+const fetchHeadPath = srcDir + "ExpressLRS/.git/FETCH_HEAD";
+const packedRefsPath = srcDir + "ExpressLRS/.git/packed-refs";
 
 // handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) { // eslint-disable-line global-require
@@ -458,7 +460,7 @@ function cloneExpressLRS() {
         });
     } else {
         log.info("Found local ExpressLRS repository");
-        startElrsConfigurator();
+        getCurrentRemoteBranch();
     }
 }
 
@@ -466,7 +468,7 @@ let cloneExpressLRSProcess = null
 
 function cloneWinExpressLRS() {
     // clone ExpressLRS using embedded Python on Windows
-    cloneExpressLRSProcess = runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -c\"\""], pullExpressLRS);
+    cloneExpressLRSProcess = runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -c\"\""], getCurrentRemoteBranch);
 }
 
 function cloneLinuxExpressLRS() {}
@@ -474,24 +476,156 @@ function cloneLinuxExpressLRS() {}
 function cloneMacExpressLRS() {}
 // cross-platform ExpressLRS clone procedures
 
+let localFetchedElrsBranches = new Map();
+let currentRemoteBranch = null;
+
+function getCurrentRemoteBranch() {
+    // update local branches map
+    updateLocalBranchesMap();
+
+    let currentHeadCommit;
+
+    const readInterface = readline.createInterface({
+        input: fs.createReadStream(srcDir + "ExpressLRS/.git/refs/heads/master"),
+        output: process.stdout,
+        console: false
+    });
+
+    readInterface.on('line', function(line) {
+        currentHeadCommit = line.trim();
+    });
+
+    readInterface.on('close', function(line) {
+        log.info('Successfully fetched ExpressLRS local repo HEAD commit: %s', currentHeadCommit);
+
+        // set proper remote branch where local HEAD is pointing
+        currentRemoteBranch = localFetchedElrsBranches.get(currentHeadCommit);
+
+        log.info('Successfully parsed current remote branch %s', currentRemoteBranch);
+
+        pullExpressLRS();
+    });
+}
+
+// fetch latest locally updated remotes from .git/packet-refs file
+function updateLocalBranchesMap() {
+    if (!localFileExists(fetchHeadPath)) {
+        parseInitialLocalBranches();
+        log.info("FETCH NOT EXISTS")
+    } else {
+        parseLocalBranchesAfterFetch();
+        log.info("FETCH EXISTS")
+    }
+}
+
+function parseLocalBranchesAfterFetch() {
+
+    const readInterface = readline.createInterface({
+        input: fs.createReadStream(fetchHeadPath),
+        output: process.stdout,
+        console: false
+    });
+
+    readInterface.on('line', function(line) {
+        commitHash = line.substring(0, 40);
+
+        lineSplit = line.split('\'');
+        branchTagIdx = 0;
+        branchName = null;
+        tagName = null;
+        for (const currentSplit of lineSplit) {
+            if (currentSplit.includes('branch')) {
+                branchTagIdx = lineSplit.indexOf(currentSplit);
+                branchName = lineSplit[branchTagIdx + 1];
+            } else if (currentSplit.includes('tag')) {
+                branchTagIdx = lineSplit.indexOf(currentSplit);
+                tagName = lineSplit[branchTagIdx + 1];
+            } else {
+                continue;
+            }
+        }
+
+        remoteName = null
+        if (null != branchName) {
+            remoteName = branchName;
+        }
+
+        if (null != tagName) {
+            remoteName = tagName;
+        }
+
+        // add to locally fetched branches
+        localFetchedElrsBranches.set(commitHash, remoteName)
+    });
+
+    readInterface.on('close', function(line) {
+        log.debug('Successfully updated ExpressLRS local branches mappings after Git fetch');
+    });
+}
+
+function parseInitialLocalBranches() {
+    const readInterface = readline.createInterface({
+        input: fs.createReadStream(packedRefsPath),
+        output: process.stdout,
+        console: false
+    });
+
+    readInterface.on('line', function(line) {
+        if (!line.startsWith('#')) {
+            commitHash = line.substring(0, 40);
+
+            lineSplit = line.split(' ');
+            fullRefsPath = lineSplit[1];
+            branchName = null;
+            tagName = null;
+            if (fullRefsPath.includes('refs/remotes/')) {
+                branchName = fullRefsPath.substring(20).trim();
+            } else {
+                // if not branch - it is tag
+                tagName = fullRefsPath.substring(10).trim();
+            }
+
+            remoteName = null
+            if (null != branchName) {
+                remoteName = branchName;
+            }
+
+            if (null != tagName) {
+                remoteName = tagName;
+            }
+
+            // add to locally fetched branches
+            localFetchedElrsBranches.set(commitHash, remoteName)
+        }
+    });
+
+    readInterface.on('close', function(line) {
+        log.debug('Successfully updated ExpressLRS initial local branches mappings');
+    });
+}
+
 // cross-platform ExpressLRS pull procedures
 function pullExpressLRS() {
     setupUpdateWindow.webContents.send('initial-elrs-pull');
 
     log.info("Updating local ExpressLRS project with latest current branch changes");
 
-    byOS({
-        [platforms.WINDOWS]: pullWinExpressLRS(),
-        [platforms.LINUX]: pullLinuxExpressLRS(),
-        [platforms.MAC]: pullMacExpressLRS(),
-    });
+    if (null != currentRemoteBranch) {
+        byOS({
+            [platforms.WINDOWS]: pullWinExpressLRS(),
+            [platforms.LINUX]: pullLinuxExpressLRS(),
+            [platforms.MAC]: pullMacExpressLRS(),
+        });
+    } else {
+        log.error('Unable to pull remote ExpressLRS repo due to missing current remote branch');
+    }
 }
 
 let pullExpressLRSProcess = null
 
 function pullWinExpressLRS() {
     // pull ExpressLRS using embedded Python on Windows
-    pullExpressLRSProcess = runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -p\"\""], startElrsConfigurator);
+    pullExpressLRSProcess = runScript("cmd", ["/C \"\"" + winDirPythonEmbedded + "\" \"" + srcDir + "elrs-cli/elrs-cli.py\" -p \"" + currentRemoteBranch + "\"\""], startElrsConfigurator);
 }
 
 function pullLinuxExpressLRS() {}
@@ -510,49 +644,18 @@ function startElrsConfigurator() {
     listElrsBranches();
 }
 
-// fetch latest locally updated remotes from .git/packet-refs file
 function listElrsBranches() {
-    let fetchedElrsRemotes = [];
+    updateLocalBranchesMap()
 
-    const readInterface = readline.createInterface({
-        input: fs.createReadStream(srcDir + "ExpressLRS/.git/packed-refs"),
-        output: process.stdout,
-        console: false
-    });
+    let parsedElrsRemotes = Array.from(localFetchedElrsBranches.values());
 
-    readInterface.on('line', function(line) {
-        if (!line.startsWith('#')) {
-            // split by space
-            lineSplit = line.split(' ');
+    log.info('Successfully parsed ExpressLRS remote branches: %s', parsedElrsRemotes);
 
-            // second element contains full remote path
-            fullRemotePath = lineSplit[1];
+    // update local ExpressLRS branches select component, keeping remote branches for select
+    mainWindow.webContents.send('update-elrs-branches-success', parsedElrsRemotes, currentRemoteBranch);
 
-            remoteName = null
-            if (fullRemotePath.includes('/remotes/')) {
-                // remove 'refs/remotes/' from full remote path
-                remoteName = fullRemotePath.substring(13)
-            }
-
-            if (fullRemotePath.includes('/tags/')) {
-                // remove 'refs/tags/' from full remote path
-                remoteName = fullRemotePath.substring(10)
-            }
-
-            // add to array list
-            fetchedElrsRemotes.push(remoteName);
-        }
-    });
-
-    readInterface.on('close', function(line) {
-        log.info('Successfully fetched ExpressLRS remote branches: %s', fetchedElrsRemotes);
-
-        // update local ExpressLRS branches select component, keeping remote branches for select
-        mainWindow.webContents.send('update-elrs-branches-success', fetchedElrsRemotes);
-
-        // fetch latest PlatformIO build targets
-        updateElrsBuildTargets();
-    });
+    // fetch latest PlatformIO build targets
+    updateElrsBuildTargets();
 }
 
 // fetch latest PlatformIO build targets from platformio.ini
